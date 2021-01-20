@@ -21,8 +21,9 @@ impl<D: DFA> RingSearcher<D> {
     }
 
     pub fn push(&mut self, input: u8) -> Option<Match> {
-        let capacity = self.buffer.capacity();
-        self.buffer.truncate(capacity - 1);
+        if self.buffer.len() + 1 > self.buffer.capacity() {
+            self.buffer.pop_front();
+        }
         self.buffer.push_back(input);
 
         let dfa = self.regex.forward();
