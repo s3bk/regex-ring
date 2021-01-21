@@ -1,5 +1,6 @@
 use regex_automata::{Regex, RegexBuilder, DFA, DenseDFA};
 use std::collections::VecDeque;
+use std::borrow::Borrow;
 
 // state to keep for each Regex
 struct Search<D: DFA> {
@@ -22,9 +23,9 @@ pub enum Error {
 ///  2. Add all regexes to search for with `add_regex` or `add_regex_str`.
 /// 
 ///  3. For every input byte:
-///     Call `push` with the input, then call `matches` to obtain matches or `matches_string` to obtain match strings.
+///     Call `push` with the input, then call `matches` to obtain matches.
 /// 
-///  4. To get the input data for a match: call `match_data` or `match_string`.
+///  4. To get the input data for a match: call `match_data`.
 ///     This should happen before the next call to `push` to avoid overwriting the data for this match.
 /// 
 pub struct RingSearcher<D: DFA> {
@@ -47,14 +48,19 @@ impl<D: DFA> RingSearcher<D> {
     }
 
     /// add a Regex to search for
-    pub fn add_regex(&mut self, regex: Regex<D>) {
+    /// 
+    /// Returns the identifier for this search.
+    /// The identifiers will be 0, 1, ...
+    pub fn add_regex(&mut self, regex: Regex<D>) -> usize {
         let state_id = regex.forward().start_state();
+        let search_nr = self.searches.len();
         self.searches.push(Search {
             state_id,
-            is_match: regex.forward().is_match_state(state_id),
             regex,
+            is_match: false, // first input byte requires this to work.
             was_match: false,
         });
+        search_nr
     }
 
     /// feed one stream byte to the searcher
@@ -82,45 +88,61 @@ impl<D: DFA> RingSearcher<D> {
         }
     }
 
-    pub fn finish(&mut self) {
-
-    }
-
-    /// obtain the matches ending at the previous input byte
+    /// Obtain the matches ending at the previous input byte.
+    /// 
+    /// The iterator yields (search identifier, match).
     pub fn matches(&self) -> impl Iterator<Item=(usize, Match)> + '_ {
         let position = self.position;
         self.searches.iter().enumerate().filter_map(move |(i, search)| {
-            match (search.was_match, search.is_match) {
-                (true, false) => {
-                    search.regex.reverse().rfind_iter(self.buffer.iter().rev().cloned().skip(1)).map(move |len| {
-                        let start = if len == self.buffer.len() {
-                            None
-                        } else {
-                            Some(position - len - 1)
-                        };
+            if (search.was_match, search.is_match) == (true, false) {
+                rfind_iter(search.regex.reverse(), self.buffer.iter().rev().cloned().skip(1)).map(move |len| {
+                    let start = if len == self.buffer.len() {
+                        None
+                    } else {
+                        Some(position - len - 1)
+                    };
 
-                        (i, Match {
-                            start,
-                            end: position - 1,
-                        })
+                    (i, Match {
+                        start,
+                        end: position - 1,
                     })
-                }
-                _ => None
+                })
+            } else {
+                None
             }
         })
     }
 
-    /// Same as `matches` but returns the match string
+    /// Obtain the final matches.
     /// 
-    /// Warning: This function allocates for every match.
-    /// Use for debugging only.
-    pub fn matches_string(&self) -> impl Iterator<Item=(usize, String)> + '_ {
-        self.matches().map(move |(i, m)| (i, self.match_string(&m)))
+    /// This will return the matches ending at the last input byte and should only be called when no more input follows.
+    /// The iterator yields (search identifier, match).
+    pub fn final_matches(&self) -> impl Iterator<Item=(usize, Match)> + '_ {
+        let position = self.position;
+        self.searches.iter().enumerate().filter_map(move |(i, search)| {
+            if search.is_match {
+                rfind_iter(search.regex.reverse(), self.buffer.iter().rev().cloned()).map(move |len| {
+                    let start = if len == self.buffer.len() {
+                        None
+                    } else {
+                        Some(position - len)
+                    };
+
+                    (i, Match {
+                        start,
+                        end: position,
+                    })
+                })
+            } else {
+                None
+            }
+        })
     }
+
 
     /// Obtain the data for a specific match, as far as it is still in the buffer.
     /// Data is obtained as a pair of slices to avoid copying.
-    pub fn match_data(&self, match_: &Match) -> (&[u8], &[u8]) {
+    pub fn match_data(&self, match_: &Match) -> MatchData {
         let (head, tail) = self.buffer.as_slices();
 
         // first data byte in self.buffer is at this stream position
@@ -132,14 +154,33 @@ impl<D: DFA> RingSearcher<D> {
         // position of match end in the buffer
         let end = match_.end - offset;
         
-        (slice_window(head, start, end), slice_window(tail, start.saturating_sub(head.len()), end.saturating_sub(head.len())))
+        MatchData {
+            head: slice_window(head, start, end),
+            tail: slice_window(tail, start.saturating_sub(head.len()), end.saturating_sub(head.len()))
+        }
     }
 
-    /// Obtain the String for a specific match, as far as it is still in the buffer.
-    /// Warning: Allocates.
-    pub fn match_string(&self, match_: &Match) -> String {
-        let (head, tail) = self.match_data(match_);
-        format!("{}{}", String::from_utf8_lossy(head), String::from_utf8_lossy(tail))
+    /// Perform matching on the entire input iterator and call `callback` for every match.
+    /// 
+    /// The callback recieves:
+    ///  - search id
+    ///  - the match
+    ///  - the match data
+    pub fn input_matches<I, V, F>(&mut self, input: I, mut callback: F)
+        where I: IntoIterator<Item=V>, V: Borrow<u8>, F: FnMut(usize, &Match, MatchData)
+    {
+        for b in input.into_iter() {
+            self.push(*b.borrow());
+            for (re_nr, match_) in self.matches() {
+                let data = self.match_data(&match_);
+                callback(re_nr, &match_, data);
+            }
+        }
+
+        for (re_nr, match_) in self.final_matches() {
+            let data = self.match_data(&match_);
+            callback(re_nr, &match_, data);
+        }
     }
 }
 
@@ -156,6 +197,29 @@ fn slice_window(slice: &[u8], start: usize, end: usize) -> &[u8] {
     &slice[start.min(slice.len()) .. end.min(slice.len())]
 }
 
+
+/// Works like rfind, but returns the number of bytes in the reverse direction and takes an iterator input.
+fn rfind_iter<D: DFA>(dfa: &D, bytes: impl Iterator<Item=u8>) -> Option<usize> {
+    let mut state = dfa.start_state();
+    let mut last_match = if dfa.is_dead_state(state) {
+        return None;
+    } else if dfa.is_match_state(state) {
+        Some(0)
+    } else {
+        None
+    };
+    for (i, b) in bytes.enumerate() {
+        state = unsafe { dfa.next_state_unchecked(state, b) };
+        if dfa.is_match_or_dead_state(state) {
+            if dfa.is_dead_state(state) {
+                return last_match;
+            }
+            last_match = Some(i + 1);
+        }
+    }
+    last_match
+}
+
 /// Match object.
 /// 
 /// Contains the stream positions of the match.
@@ -164,4 +228,42 @@ fn slice_window(slice: &[u8], start: usize, end: usize) -> &[u8] {
 pub struct Match {
     pub start: Option<usize>,
     pub end: usize,
+}
+
+/// Input data for a Match.
+/// 
+/// Internally composed of two slices into the ringbuffer.
+#[derive(Copy, Clone, Debug)]
+pub struct MatchData<'a> {
+    pub head: &'a [u8],
+    pub tail: &'a [u8],
+}
+impl<'a> MatchData<'a> {
+    /// Obtain the String for this match data.
+    /// 
+    /// Warning: Allocates.
+    pub fn to_string(&self) -> String {
+        format!("{}{}", String::from_utf8_lossy(self.head), String::from_utf8_lossy(self.tail))
+    }
+
+    /// Obtain the data of this match as a `Vec<u8>`
+    pub fn to_vec(&self) -> Vec<u8> {
+        [self.head, self.tail].concat()
+    }
+
+    /// Length of match data
+    pub fn len(&self) -> usize {
+        self.head.len() + self.tail.len()
+    }
+}
+
+impl<'a> PartialEq<[u8]> for MatchData<'a> {
+    fn eq(&self, rhs: &[u8]) -> bool {
+        let MatchData { head, tail } = *self;
+        if self.len() != rhs.len() {
+            return false;
+        }
+        let (rhs_head, rhs_tail) = rhs.split_at(head.len());
+        head == rhs_head && tail == rhs_tail
+    }
 }

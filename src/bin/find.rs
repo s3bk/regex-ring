@@ -1,8 +1,7 @@
 use std::{env, io, str};
 use std::io::Read;
 
-use regex_automata::RegexBuilder;
-use regex_ring::{RingSearcher, Match};
+use regex_ring::{RingSearcher};
 
 fn main() {
     let mut args = env::args();
@@ -14,14 +13,8 @@ fn main() {
         searcher.add_regex_str(&regex_str).expect("invalid regex");
     }
 
-    for b in io::stdin().lock().bytes() {
-        searcher.push(b.unwrap());
-        for (i, m) in searcher.matches() {
-            println!("#{} {:?}", i, m);
-            let (head, tail) = searcher.match_data(&m);
-            if let (Ok(a), Ok(b)) = (str::from_utf8(head), str::from_utf8(tail)) {
-                println!("> {}{}", a, b);
-            }
-        }
-    }
+    searcher.input_matches(io::stdin().lock().bytes().flat_map(Result::ok), |search_id, match_, match_data| {
+        println!("#{} {:?}", search_id, match_);
+        println!("> {}", match_data.to_string());
+    });
 }
